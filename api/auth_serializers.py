@@ -1,5 +1,4 @@
 from django.contrib.auth.models import User
-from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 
 from .models import UserProfile
@@ -10,146 +9,80 @@ class UserProfileSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = UserProfile
-        fields = ['phone_number', 'avatar_url', 'is_google_user']
-        read_only_fields = ['is_google_user']
+        fields = [
+            'bio', 'institution', 'department', 'research_interests',
+            'website', 'google_scholar', 'orcid', 'avatar_url',
+            'twitter', 'linkedin', 'is_contributor',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['created_at', 'updated_at']
 
 
 class UserSerializer(serializers.ModelSerializer):
     """Serializer for User model with profile data."""
     
-    profile = UserProfileSerializer(source='userprofile', read_only=True)
+    profile = UserProfileSerializer(read_only=True)
     full_name = serializers.SerializerMethodField()
     
     class Meta:
         model = User
-        fields = ['id', 'email', 'username', 'first_name', 'last_name', 'full_name', 
-                  'date_joined', 'last_login', 'profile']
+        fields = [
+            'id', 'email', 'username', 'first_name', 'last_name', 
+            'full_name', 'date_joined', 'last_login', 'profile'
+        ]
         read_only_fields = ['id', 'email', 'date_joined', 'last_login']
     
     def get_full_name(self, obj):
         """Return full name or email if name not set."""
         full_name = f"{obj.first_name} {obj.last_name}".strip()
-        return full_name if full_name else obj.email
-
-
-class RegisterSerializer(serializers.ModelSerializer):
-    """Serializer for user registration."""
-    
-    email = serializers.EmailField(required=True)
-    password = serializers.CharField(
-        write_only=True, 
-        required=True, 
-        validators=[validate_password],
-        style={'input_type': 'password'}
-    )
-    password_confirm = serializers.CharField(
-        write_only=True, 
-        required=True,
-        style={'input_type': 'password'}
-    )
-    first_name = serializers.CharField(required=False, allow_blank=True)
-    last_name = serializers.CharField(required=False, allow_blank=True)
-    
-    class Meta:
-        model = User
-        fields = ['email', 'password', 'password_confirm', 'first_name', 'last_name']
-    
-    def validate_email(self, value):
-        """Ensure email is unique."""
-        if User.objects.filter(email__iexact=value).exists():
-            raise serializers.ValidationError("A user with this email already exists.")
-        return value.lower()
-    
-    def validate(self, attrs):
-        """Validate that passwords match."""
-        if attrs.get('password') != attrs.get('password_confirm'):
-            raise serializers.ValidationError({
-                "password_confirm": "Password fields didn't match."
-            })
-        return attrs
-    
-    def create(self, validated_data):
-        """Create new user with profile."""
-        validated_data.pop('password_confirm')
-        
-        user = User.objects.create_user(
-            username=validated_data['email'],  # Use email as username
-            email=validated_data['email'],
-            password=validated_data['password'],
-            first_name=validated_data.get('first_name', ''),
-            last_name=validated_data.get('last_name', ''),
-        )
-        
-        # Create associated profile
-        UserProfile.objects.create(user=user)
-        
-        return user
-
-
-class OTPSendSerializer(serializers.Serializer):
-    """Serializer for OTP send requests."""
-    
-    email = serializers.EmailField(required=True)
-    otp_type = serializers.ChoiceField(
-        choices=['login', 'registration'],
-        default='login'
-    )
-    
-    def validate_email(self, value):
-        """Normalize email to lowercase."""
-        return value.lower()
-
-
-class OTPVerifySerializer(serializers.Serializer):
-    """Serializer for OTP verification requests."""
-    
-    email = serializers.EmailField(required=True)
-    otp = serializers.CharField(min_length=6, max_length=6, required=True)
-    otp_type = serializers.ChoiceField(
-        choices=['login', 'registration'],
-        default='login'
-    )
-    # Optional fields for registration
-    first_name = serializers.CharField(required=False, allow_blank=True)
-    last_name = serializers.CharField(required=False, allow_blank=True)
-    
-    def validate_email(self, value):
-        """Normalize email to lowercase."""
-        return value.lower()
-    
-    def validate_otp(self, value):
-        """Ensure OTP contains only digits."""
-        if not value.isdigit():
-            raise serializers.ValidationError("OTP must contain only digits.")
-        return value
-
-
-class GoogleAuthSerializer(serializers.Serializer):
-    """Serializer for Google OAuth token."""
-    
-    credential = serializers.CharField(required=True)
+        return full_name if full_name else obj.email.split('@')[0]
 
 
 class ProfileUpdateSerializer(serializers.ModelSerializer):
     """Serializer for profile updates."""
     
-    first_name = serializers.CharField(source='user.first_name', required=False)
-    last_name = serializers.CharField(source='user.last_name', required=False)
+    # User fields
+    first_name = serializers.CharField(required=False, allow_blank=True)
+    last_name = serializers.CharField(required=False, allow_blank=True)
+    
+    # Profile fields
+    bio = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    institution = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    department = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    research_interests = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        default=list
+    )
+    website = serializers.URLField(required=False, allow_blank=True, allow_null=True)
+    google_scholar = serializers.URLField(required=False, allow_blank=True, allow_null=True)
+    orcid = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    avatar_url = serializers.URLField(required=False, allow_blank=True, allow_null=True)
+    twitter = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    linkedin = serializers.URLField(required=False, allow_blank=True, allow_null=True)
     
     class Meta:
         model = UserProfile
-        fields = ['first_name', 'last_name', 'phone_number', 'avatar_url']
+        fields = [
+            'first_name', 'last_name',
+            'bio', 'institution', 'department', 'research_interests',
+            'website', 'google_scholar', 'orcid', 'avatar_url',
+            'twitter', 'linkedin'
+        ]
     
     def update(self, instance, validated_data):
         """Update user and profile data."""
-        user_data = validated_data.pop('user', {})
+        # Extract user fields
+        first_name = validated_data.pop('first_name', None)
+        last_name = validated_data.pop('last_name', None)
         
         # Update User fields
-        if user_data:
-            user = instance.user
-            for attr, value in user_data.items():
-                setattr(user, attr, value)
-            user.save()
+        user = instance.user
+        if first_name is not None:
+            user.first_name = first_name
+        if last_name is not None:
+            user.last_name = last_name
+        user.save()
         
         # Update Profile fields
         for attr, value in validated_data.items():
@@ -157,3 +90,47 @@ class ProfileUpdateSerializer(serializers.ModelSerializer):
         instance.save()
         
         return instance
+
+
+class MagicLinkRequestSerializer(serializers.Serializer):
+    """Serializer for magic link request."""
+    
+    email = serializers.EmailField(required=True)
+    
+    def validate_email(self, value):
+        """Normalize email to lowercase."""
+        return value.lower().strip()
+
+
+class MagicLinkVerifySerializer(serializers.Serializer):
+    """Serializer for magic link verification."""
+    
+    token = serializers.UUIDField(required=True)
+
+
+class AuthorSerializer(serializers.ModelSerializer):
+    """Minimal serializer for author info in papers/comments."""
+    
+    full_name = serializers.SerializerMethodField()
+    avatar_url = serializers.SerializerMethodField()
+    institution = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = User
+        fields = ['id', 'username', 'full_name', 'avatar_url', 'institution']
+    
+    def get_full_name(self, obj):
+        full_name = f"{obj.first_name} {obj.last_name}".strip()
+        return full_name if full_name else obj.email.split('@')[0]
+    
+    def get_avatar_url(self, obj):
+        try:
+            return obj.profile.avatar_url
+        except UserProfile.DoesNotExist:
+            return None
+    
+    def get_institution(self, obj):
+        try:
+            return obj.profile.institution
+        except UserProfile.DoesNotExist:
+            return None

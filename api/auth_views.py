@@ -1,21 +1,21 @@
 import os
-import secrets
 from datetime import timedelta
 
 from django.contrib.auth.models import User
 from django.core.mail import send_mail
 from django.conf import settings
+from django.template.loader import render_to_string
 from django.utils import timezone
+from django.utils.html import strip_tags
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
-from google.oauth2 import id_token
-from google.auth.transport import requests as google_requests
+from rest_framework_simplejwt.token_blacklist.models import OutstandingToken, BlacklistedToken
 
-from .auth_serializers import RegisterSerializer, UserSerializer
-from .models import UserProfile, OTPVerification
+from .models import MagicLink, UserProfile
+from .auth_serializers import UserSerializer, ProfileUpdateSerializer
 
 
 def get_tokens_for_user(user):
@@ -27,130 +27,19 @@ def get_tokens_for_user(user):
     }
 
 
-@api_view(['POST'])
-@permission_classes([AllowAny])
-def register(request):
-    """Standard registration with email/password."""
-    serializer = RegisterSerializer(data=request.data)
-    if serializer.is_valid():
-        user = serializer.save()
-        # Create user profile
-        UserProfile.objects.get_or_create(user=user)
-        tokens = get_tokens_for_user(user)
-        return Response({
-            'message': 'Registration successful.',
-            'user': UserSerializer(user).data,
-            'tokens': tokens
-        }, status=status.HTTP_201_CREATED)
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+def get_frontend_url():
+    """Get the frontend URL from environment or default."""
+    return os.environ.get('FRONTEND_URL', 'https://nskailabs.com')
 
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
-def google_auth(request):
+def request_magic_link(request):
     """
-    Authenticate with Google OAuth2.
-    Expects: { "credential": "<Google ID Token>" }
-    """
-    credential = request.data.get('credential')
-    
-    if not credential:
-        return Response(
-            {'error': 'Google credential is required.'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
-    
-    google_client_id = os.environ.get('GOOGLE_CLIENT_ID', '')
-    
-    if not google_client_id:
-        return Response(
-            {'error': 'Google authentication is not configured.'},
-            status=status.HTTP_503_SERVICE_UNAVAILABLE
-        )
-    
-    try:
-        # Verify the Google ID token
-        idinfo = id_token.verify_oauth2_token(
-            credential,
-            google_requests.Request(),
-            google_client_id
-        )
-        
-        google_id = idinfo['sub']
-        email = idinfo.get('email', '')
-        first_name = idinfo.get('given_name', '')
-        last_name = idinfo.get('family_name', '')
-        avatar_url = idinfo.get('picture', '')
-        
-        # Check if user exists with this Google ID
-        try:
-            profile = UserProfile.objects.get(google_id=google_id)
-            user = profile.user
-        except UserProfile.DoesNotExist:
-            # Check if user exists with this email
-            try:
-                user = User.objects.get(email=email)
-                # Link Google account to existing user
-                profile, _ = UserProfile.objects.get_or_create(user=user)
-                profile.google_id = google_id
-                profile.is_google_user = True
-                profile.avatar_url = avatar_url
-                profile.save()
-            except User.DoesNotExist:
-                # Create new user
-                username = email.split('@')[0]
-                base_username = username
-                counter = 1
-                while User.objects.filter(username=username).exists():
-                    username = f"{base_username}{counter}"
-                    counter += 1
-                
-                user = User.objects.create_user(
-                    username=username,
-                    email=email,
-                    first_name=first_name,
-                    last_name=last_name,
-                )
-                user.set_unusable_password()
-                user.save()
-                
-                UserProfile.objects.create(
-                    user=user,
-                    google_id=google_id,
-                    is_google_user=True,
-                    avatar_url=avatar_url,
-                )
-        
-        tokens = get_tokens_for_user(user)
-        
-        return Response({
-            'message': 'Google authentication successful.',
-            'user': UserSerializer(user).data,
-            'tokens': tokens,
-            'is_new_user': False,
-        })
-        
-    except ValueError as e:
-        return Response(
-            {'error': 'Invalid Google credential.'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
-    except Exception as e:
-        return Response(
-            {'error': f'Authentication failed: {str(e)}'},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
-
-
-@api_view(['POST'])
-@permission_classes([AllowAny])
-def send_otp(request):
-    """
-    Send OTP to email for verification.
-    Expects: { "email": "<email>", "otp_type": "registration|login|password_reset" }
+    Request a magic link for authentication.
+    Expects: { "email": "user@example.com" }
     """
     email = request.data.get('email', '').strip().lower()
-    otp_type = request.data.get('otp_type', 'registration')
     
     if not email:
         return Response(
@@ -158,68 +47,93 @@ def send_otp(request):
             status=status.HTTP_400_BAD_REQUEST
         )
     
-    # Check rate limiting - max 3 OTPs per email per hour
-    recent_otps = OTPVerification.objects.filter(
+    # Basic email validation
+    if '@' not in email or '.' not in email:
+        return Response(
+            {'error': 'Please enter a valid email address.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    # Rate limiting - max 5 magic links per email per hour
+    recent_links = MagicLink.objects.filter(
         email=email,
         created_at__gte=timezone.now() - timedelta(hours=1)
     ).count()
     
-    if recent_otps >= 3:
+    if recent_links >= 5:
         return Response(
-            {'error': 'Too many OTP requests. Please try again later.'},
+            {'error': 'Too many requests. Please try again later.'},
             status=status.HTTP_429_TOO_MANY_REQUESTS
         )
     
-    # For login/password_reset, check if user exists
-    user = None
-    if otp_type in ['login', 'password_reset']:
-        try:
-            user = User.objects.get(email=email)
-        except User.DoesNotExist:
-            return Response(
-                {'error': 'No account found with this email.'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+    # Create magic link
+    magic_link = MagicLink.create_for_email(email)
     
-    # For registration, check if email is already taken
-    if otp_type == 'registration':
-        if User.objects.filter(email=email).exists():
-            return Response(
-                {'error': 'An account with this email already exists.'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+    # Build verification URL
+    frontend_url = get_frontend_url()
+    verification_url = f"{frontend_url}/auth/verify?token={magic_link.token}"
     
-    # Invalidate previous OTPs for this email
-    OTPVerification.objects.filter(
-        email=email,
-        is_verified=False
-    ).update(is_verified=True)
-    
-    # Generate new OTP
-    otp_code = OTPVerification.generate_otp()
-    
-    otp_record = OTPVerification.objects.create(
-        user=user,
-        email=email,
-        otp_code=otp_code,
-        otp_type=otp_type,
-        expires_at=timezone.now() + timedelta(minutes=10)
-    )
-    
-    # Send OTP via email
+    # Send email
     try:
-        subject = f"Your NSKAILabs Verification Code: {otp_code}"
+        subject = "Sign in to NSKAILabs"
+        
+        # Plain text version
         message = f"""
 Hello,
 
-Your verification code for NSKAILabs is: {otp_code}
+Click the link below to sign in to NSKAILabs:
 
-This code will expire in 10 minutes.
+{verification_url}
 
-If you did not request this code, please ignore this email.
+This link will expire in 15 minutes.
+
+If you didn't request this link, you can safely ignore this email.
 
 Best regards,
-NSKAILabs Team
+The NSKAILabs Team
+
+---
+NSKAILabs - Open Research in Nanophotonics & Metasurfaces
+https://nskailabs.com
+        """
+        
+        # HTML version
+        html_message = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px;">
+    <div style="text-align: center; margin-bottom: 30px;">
+        <h1 style="color: #2563eb; margin: 0; font-size: 24px;">NSKAILabs</h1>
+        <p style="color: #6b7280; margin: 5px 0 0 0; font-size: 14px;">Open Research in Nanophotonics & Metasurfaces</p>
+    </div>
+    
+    <div style="background: #f8fafc; border-radius: 12px; padding: 30px; margin-bottom: 20px;">
+        <h2 style="margin: 0 0 15px 0; font-size: 20px; color: #1f2937;">Sign in to your account</h2>
+        <p style="margin: 0 0 25px 0; color: #4b5563;">Click the button below to sign in. This link will expire in 15 minutes.</p>
+        
+        <a href="{verification_url}" style="display: inline-block; background: #2563eb; color: white; padding: 14px 32px; text-decoration: none; border-radius: 8px; font-weight: 600; font-size: 16px;">
+            Sign in to NSKAILabs
+        </a>
+    </div>
+    
+    <p style="color: #6b7280; font-size: 13px; margin-bottom: 10px;">
+        Or copy and paste this link into your browser:
+    </p>
+    <p style="background: #f1f5f9; padding: 12px; border-radius: 6px; font-size: 12px; word-break: break-all; color: #475569;">
+        {verification_url}
+    </p>
+    
+    <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 30px 0;">
+    
+    <p style="color: #9ca3af; font-size: 12px; text-align: center;">
+        If you didn't request this link, you can safely ignore this email.
+    </p>
+</body>
+</html>
         """
         
         send_mail(
@@ -227,89 +141,79 @@ NSKAILabs Team
             message=message,
             from_email=settings.DEFAULT_FROM_EMAIL,
             recipient_list=[email],
+            html_message=html_message,
             fail_silently=False,
         )
         
         return Response({
-            'message': 'OTP sent successfully.',
+            'message': 'Magic link sent to your email.',
             'email': email,
-            'expires_in_minutes': 10,
+            'expires_in_minutes': 15,
         })
         
     except Exception as e:
-        otp_record.delete()
+        # Delete the magic link if email failed
+        magic_link.delete()
         return Response(
-            {'error': 'Failed to send OTP. Please try again.'},
+            {'error': 'Failed to send email. Please try again.'},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
-def verify_otp(request):
+def verify_magic_link(request):
     """
-    Verify OTP and complete authentication.
-    Expects: { "email": "<email>", "otp": "<6-digit-code>", "otp_type": "registration|login", ... }
-    For registration, also expects: { "username": "<username>", "first_name": "...", "last_name": "..." }
+    Verify magic link token and authenticate user.
+    Expects: { "token": "uuid-token" }
     """
-    email = request.data.get('email', '').strip().lower()
-    otp_code = request.data.get('otp', '').strip()
-    otp_type = request.data.get('otp_type', 'registration')
+    token = request.data.get('token', '').strip()
     
-    if not email or not otp_code:
+    if not token:
         return Response(
-            {'error': 'Email and OTP are required.'},
+            {'error': 'Token is required.'},
             status=status.HTTP_400_BAD_REQUEST
         )
     
-    # Find the latest unverified OTP for this email
+    # Find the magic link
     try:
-        otp_record = OTPVerification.objects.filter(
-            email=email,
-            otp_type=otp_type,
-            is_verified=False
-        ).latest('created_at')
-    except OTPVerification.DoesNotExist:
+        magic_link = MagicLink.objects.get(token=token)
+    except MagicLink.DoesNotExist:
         return Response(
-            {'error': 'No pending OTP found for this email.'},
+            {'error': 'Invalid or expired link. Please request a new one.'},
             status=status.HTTP_404_NOT_FOUND
         )
     
+    # Check if already used
+    if magic_link.is_used:
+        return Response(
+            {'error': 'This link has already been used. Please request a new one.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
     # Check if expired
-    if otp_record.is_expired():
+    if magic_link.is_expired():
         return Response(
-            {'error': 'OTP has expired. Please request a new one.'},
+            {'error': 'This link has expired. Please request a new one.'},
             status=status.HTTP_400_BAD_REQUEST
         )
     
-    # Check max attempts
-    if otp_record.is_max_attempts_reached():
-        return Response(
-            {'error': 'Maximum verification attempts reached. Please request a new OTP.'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
+    # Mark as used
+    magic_link.is_used = True
+    magic_link.save()
     
-    # Verify OTP
-    if otp_record.otp_code != otp_code:
-        otp_record.attempts += 1
-        otp_record.save()
-        remaining = otp_record.max_attempts - otp_record.attempts
-        return Response(
-            {'error': f'Invalid OTP. {remaining} attempts remaining.'},
-            status=status.HTTP_400_BAD_REQUEST
-        )
+    email = magic_link.email
+    is_new_user = False
     
-    # OTP is valid - mark as verified
-    otp_record.is_verified = True
-    otp_record.save()
-    
-    if otp_type == 'registration':
+    # Get or create user
+    try:
+        user = User.objects.get(email=email)
+    except User.DoesNotExist:
         # Create new user
-        username = request.data.get('username', email.split('@')[0])
-        first_name = request.data.get('first_name', '')
-        last_name = request.data.get('last_name', '')
+        is_new_user = True
         
-        # Ensure unique username
+        # Generate username from email
+        username = email.split('@')[0]
         base_username = username
         counter = 1
         while User.objects.filter(username=username).exists():
@@ -319,65 +223,82 @@ def verify_otp(request):
         user = User.objects.create_user(
             username=username,
             email=email,
-            first_name=first_name,
-            last_name=last_name,
         )
         user.set_unusable_password()
         user.save()
         
+        # Create profile
         UserProfile.objects.create(user=user)
-        
-        tokens = get_tokens_for_user(user)
-        
-        return Response({
-            'message': 'Registration successful.',
-            'user': UserSerializer(user).data,
-            'tokens': tokens,
-        }, status=status.HTTP_201_CREATED)
     
-    elif otp_type == 'login':
-        # Login existing user
-        try:
-            user = User.objects.get(email=email)
-            tokens = get_tokens_for_user(user)
-            
-            return Response({
-                'message': 'Login successful.',
-                'user': UserSerializer(user).data,
-                'tokens': tokens,
-            })
-        except User.DoesNotExist:
-            return Response(
-                {'error': 'User not found.'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+    # Ensure profile exists for existing users
+    UserProfile.objects.get_or_create(user=user)
     
-    return Response({'message': 'OTP verified successfully.'})
+    # Update last login
+    user.last_login = timezone.now()
+    user.save(update_fields=['last_login'])
+    
+    # Generate tokens
+    tokens = get_tokens_for_user(user)
+    
+    return Response({
+        'message': 'Authentication successful.',
+        'user': UserSerializer(user).data,
+        'tokens': tokens,
+        'is_new_user': is_new_user,
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def logout(request):
+    """
+    Logout user by blacklisting their refresh token.
+    Expects: { "refresh": "refresh-token" }
+    """
+    refresh_token = request.data.get('refresh')
+    
+    if not refresh_token:
+        return Response(
+            {'error': 'Refresh token is required.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    try:
+        token = RefreshToken(refresh_token)
+        token.blacklist()
+        return Response({'message': 'Successfully logged out.'})
+    except Exception:
+        return Response(
+            {'error': 'Invalid token.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
 
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
-def me(request):
-    """Get current user profile."""
-    user_data = UserSerializer(request.user).data
-    
-    # Add profile data if exists
-    try:
-        profile = request.user.profile
-        user_data['is_google_user'] = profile.is_google_user
-        user_data['avatar_url'] = profile.avatar_url
-    except UserProfile.DoesNotExist:
-        pass
-    
-    return Response(user_data)
+def get_user(request):
+    """Get current authenticated user."""
+    return Response(UserSerializer(request.user).data)
 
 
-@api_view(['PUT'])
+@api_view(['PUT', 'PATCH'])
 @permission_classes([IsAuthenticated])
 def update_profile(request):
     """Update user profile."""
-    serializer = UserSerializer(request.user, data=request.data, partial=True)
+    try:
+        profile = request.user.profile
+    except UserProfile.DoesNotExist:
+        profile = UserProfile.objects.create(user=request.user)
+    
+    serializer = ProfileUpdateSerializer(
+        profile, 
+        data=request.data, 
+        partial=True,
+        context={'request': request}
+    )
+    
     if serializer.is_valid():
         serializer.save()
-        return Response(serializer.data)
+        return Response(UserSerializer(request.user).data)
+    
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
