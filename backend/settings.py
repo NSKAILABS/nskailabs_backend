@@ -1,9 +1,12 @@
 import os
 from pathlib import Path
 import dj_database_url
+from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Load .env file
+load_dotenv(BASE_DIR / '.env')
 SECRET_KEY = os.environ.get('SECRET_KEY')
 
 DEBUG = os.environ.get('DJANGO_DEBUG')
@@ -53,18 +56,22 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'backend.wsgi.application'
 
+import dj_database_url
+
 DATABASE_URL = os.environ.get('DATABASE_URL')
+
 if DATABASE_URL:
-    db_config = dj_database_url.parse(DATABASE_URL, conn_max_age= 600)
-    
+    db_config = dj_database_url.parse(DATABASE_URL, conn_max_age=600)
+
+    # For Neon / external postgres
     if 'neon.tech' in DATABASE_URL:
-        db_config['OPTIONS'] = {"sslmode" : "require"}
-        
-    DATABASES = {"default" : db_config}
+        db_config['OPTIONS'] = {"sslmode": "require"}
+
     DATABASES = {
-        'default': dj_database_url.parse(DATABASE_URL, conn_max_age=600)
+        'default': db_config
     }
 else:
+    print("⚠️ Using SQLite (fallback)")
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.sqlite3',
@@ -89,7 +96,7 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-CORS_ALLOWED_ORIGINS_STR = os.environ.get('CORS_ALLOWED_ORIGINS', "http://localhost:5000")
+CORS_ALLOWED_ORIGINS_STR = os.environ.get('CORS_ALLOWED_ORIGINS')
 if CORS_ALLOWED_ORIGINS_STR:
     CORS_ALLOW_ALL_ORIGINS = False
     CORS_ALLOWED_ORIGINS = [o.strip() for o in CORS_ALLOWED_ORIGINS_STR.split(',') if o.strip()]
@@ -99,7 +106,7 @@ else:
 CORS_ALLOW_CREDENTIALS = True
 
 if not DEBUG:
-    SECURE_SSL_REDIRECT = os.environ.get('SECURE_SSL_REDIRECT', "true")
+    SECURE_SSL_REDIRECT = os.environ.get('SECURE_SSL_REDIRECT')
     SECURE_HSTS_SECONDS = 31536000
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
     SECURE_HSTS_PRELOAD = True
@@ -145,4 +152,4 @@ GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '')
 GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET', '')
  
 # MetaOptics External Platform URL
-METAOPTICS_EMBED_URL = os.environ.get('METAOPTICS_EMBED_URL', 'https://dghfngbdfvxc-metaopticsai-license-server.hf.space/')
+METAOPTICS_EMBED_URL = os.environ.get('METAOPTICS_EMBED_URL')
