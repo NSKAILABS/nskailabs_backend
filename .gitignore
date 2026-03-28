@@ -8,7 +8,7 @@ staticfiles
 .venv/
 venv/
 env/
-
+docs
 # Environment variables
 .env
 
